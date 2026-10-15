@@ -123,3 +123,24 @@ tests/test_tracker.py
 ```
 
 MIT license; unofficial, not affiliated with Pump.fun or Apple.
+
+## GitHub monitoring (expanded)
+
+The tracker now discovers publicly visible repositories under `GITHUB_OWNER` (default: `pump-fun`), alerts when the **list of public repositories changes**, and checks the latest commit, release, and tags for up to `GITHUB_MAX_REPOS` recently updated repositories. Explicit `GITHUB_REPOS` entries are always checked too. This watches public GitHub activity only; it cannot see private code, unreleased iOS builds, or prove that a change was deployed to the iPhone app.
+
+Railway environment variables:
+
+```env
+GITHUB_OWNER=pump-fun
+GITHUB_AUTO_DISCOVER=true
+GITHUB_MAX_REPOS=15
+GITHUB_REPOS=pump-fun/pump-public-docs
+# Optional: use a fine-grained read-only GitHub token to check on every regular scan
+GITHUB_TOKEN=
+```
+
+GitHub limits unauthenticated API requests to 60/hour, so without `GITHUB_TOKEN` repository checks are automatically spaced **at least one hour** apart; the normal App Store and webpage scans remain at the configured interval. With a GitHub token, repo checks run on the normal interval (ensure your token permits reading the public repositories). Keep tokens only in Railway variables, not in GitHub files. With many repos, you may want to reduce `GITHUB_MAX_REPOS` to avoid excessive polling.
+
+**Pump.fun HTML fix:** Website page fetches now stream with an 8 MB upper bound (previously 2 MB). The limit still protects the bot from unexpectedly large responses. A `Response exceeds 8 MB limit` warning indicates the site is bigger still; you can temporarily set `WEB_URLS` empty to skip the web monitor without affecting GitHub/App Store.
+
+**Updating an existing Railway bot:** Replace `tracker.py` with the new copy and update `.env.example` / `README.md` in GitHub. Set the GitHub variables above in Railway. Keep the existing `/data` volume and `DATABASE_PATH` intact, so your baselines/history are preserved. GitHub repo discovery and new GitHub categories create baselines on their first successful run and alert only on later differences.

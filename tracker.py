@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -31,6 +32,10 @@ DB_PATH = os.getenv("DATABASE_PATH", "./pumpfun.sqlite3")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID") or "0")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID") or "0")
 ENABLE_WEB_ASSETS = os.getenv("ENABLE_WEB_ASSETS", "true").lower() == "true"
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "pump-fun").strip()
+GITHUB_AUTO_DISCOVER = os.getenv("GITHUB_AUTO_DISCOVER", "true").lower() == "true"
+GITHUB_MAX_REPOS = max(1, min(50, int(os.getenv("GITHUB_MAX_REPOS", "15"))))
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
 
 def csv_env(name: str, default: str = "") -> list[str]:
@@ -180,6 +185,7 @@ class Monitor:
         self.lock = asyncio.Lock()
         self.last_run = "never"
         self.failures = {}
+        self.last_github_scan = 0.0
 
     async def close(self):
         await self.client.aclose()
@@ -187,13 +193,26 @@ class Monitor:
     async def get(self, url: str, kind="pump", json_body=False):
         if not is_allowed_url(url, kind):
             raise ValueError("URL must be a public, allowed HTTPS host")
-        response = await self.client.get(url, headers={"Accept": "application/json" if json_body else "text/html,application/json"})
-        if response.is_redirect:
-            raise ValueError("Redirect refused; no cross-host redirects followed")
-        response.raise_for_status()
-        if len(response.content) > 2_000_000:
-            raise ValueError("Response exceeds 2 MB limit")
-        return response.json() if json_body else response.text
+        # Pump.fun HTML often exceeds 2MB; stream a bounded amount instead of
+        # loading unbounded pages in RAM. GitHub/Apple/JSON remain at 2 MB.
+        max_bytes = 8_000_000 if kind == "pump" and not json_body else 2_000_000
+        headers = {"Accept": "application/json" if json_body else "text/html,application/json"}
+        if kind == "github":
+            headers["Accept"] = "application/vnd.github+json"
+            if GITHUB_TOKEN:
+                headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        async with self.client.stream("GET", url, headers=headers) as response:
+            if response.is_redirect:
+                raise ValueError("Redirect refused; no cross-host redirects followed")
+            response.raise_for_status()
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(data) + len(chunk) > max_bytes:
+                    raise ValueError(f"Response exceeds {max_bytes // 1_000_000} MB limit")
+                data.extend(chunk)
+            encoding = response.encoding or "utf-8"
+            text = data.decode(encoding, errors="replace")
+            return json.loads(text) if json_body else text
 
     async def appstore(self) -> list[Observation]:
         url = f"https://itunes.apple.com/lookup?id={APP_ID}&country=us"
@@ -262,16 +281,61 @@ class Monitor:
         return [Observation(f"api:{kind}:{url}", kind, url, data, f"{kind} schema: {urlparse(url).hostname}")]
 
     async def github(self, repo: str) -> list[Observation]:
+        """Track commits, latest release and tags for each watched public repo."""
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError("Invalid public repository")
-        url = f"https://api.github.com/repos/{repo}/commits?per_page=1"
-        data = await self.get(url, "github", True)
+        base = f"https://api.github.com/repos/{repo}"
+        # Commit failures are reported; empty releases/tags are normal (404/[]).
+        data = await self.get(f"{base}/commits?per_page=1", "github", True)
         if not isinstance(data, list) or not data:
             raise ValueError("No public commits")
         item = data[0]
-        commit = item.get("commit", {})
-        payload = {"sha": item.get("sha"), "message": commit.get("message", "")[:600], "date": commit.get("committer", {}).get("date")}
-        return [Observation(f"github:{repo}", "PUBLIC REPO", f"https://github.com/{repo}/commits", payload, f"GitHub: {repo}")]
+        commit = item.get("commit") or {}
+        observations = [Observation(
+            f"github:commit:{repo}", "GITHUB COMMIT", item.get("html_url") or f"https://github.com/{repo}/commits",
+            {"sha": item.get("sha"), "message": (commit.get("message") or "")[:600],
+             "date": (commit.get("committer") or {}).get("date")}, f"GitHub commit: {repo}")]
+        try:
+            releases = await self.get(f"{base}/releases?per_page=1", "github", True)
+            if isinstance(releases, list) and releases:
+                release = releases[0]
+                observations.append(Observation(
+                    f"github:release:{repo}", "GITHUB RELEASE",
+                    release.get("html_url") or f"https://github.com/{repo}/releases",
+                    {"id": release.get("id"), "tag": release.get("tag_name"),
+                     "name": release.get("name"), "published": release.get("published_at"),
+                     "draft": release.get("draft"), "prerelease": release.get("prerelease")},
+                    f"GitHub release: {repo}"))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                LOG.warning("GitHub release check %s: %s", repo, exc)
+        try:
+            tags = await self.get(f"{base}/tags?per_page=10", "github", True)
+            if isinstance(tags, list):
+                observations.append(Observation(
+                    f"github:tags:{repo}", "GITHUB TAGS", f"https://github.com/{repo}/tags",
+                    {"tags": [t.get("name") for t in tags if isinstance(t, dict)]},
+                    f"GitHub tags: {repo}"))
+        except httpx.HTTPStatusError as exc:
+            LOG.warning("GitHub tags check %s: %s", repo, exc)
+        return observations
+
+    async def github_discover(self) -> tuple[list[Observation], list[str]]:
+        """Find public repos under the configured GitHub owner (including new ones)."""
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,39}", GITHUB_OWNER):
+            raise ValueError("Invalid GITHUB_OWNER")
+        url = f"https://api.github.com/users/{GITHUB_OWNER}/repos?per_page=100&type=public&sort=updated"
+        data = await self.get(url, "github", True)
+        if not isinstance(data, list):
+            raise ValueError("GitHub repo discovery returned non-list JSON")
+        repos = [r for r in data if isinstance(r, dict) and not r.get("fork") and not r.get("archived") and r.get("full_name")]
+        # Stable normalized listing; do not alert just because the GitHub sort order changed.
+        names = sorted(r["full_name"] for r in repos)
+        obs = Observation(f"github:owner:{GITHUB_OWNER.lower()}", "GITHUB REPOSITORIES",
+                          f"https://github.com/{GITHUB_OWNER}?tab=repositories",
+                          {"repositories": names}, f"GitHub public repositories: {GITHUB_OWNER}")
+        # Limit individual repo polling to respect GitHub API rate limits.
+        return [obs], [r["full_name"] for r in repos[:GITHUB_MAX_REPOS]]
 
     async def scan(self):
         async with self.lock:
@@ -290,11 +354,32 @@ class Monitor:
             for url in sorted(api_specs):
                 if is_allowed_url(url):
                     tasks.append((url, self.json_endpoint(url, "API SPEC")))
-            for repo in csv_env("GITHUB_REPOS", "pump-fun/pump-public-docs"):
-                tasks.append((repo, self.github(repo)))
+            # Unauthenticated GitHub API has a 60-request/hour cap; check once
+            # per hour without a token. With a token, use normal scan interval.
+            github_due = (time.monotonic() - self.last_github_scan >= (INTERVAL * 60 if GITHUB_TOKEN else 3600))
+            repos = set(csv_env("GITHUB_REPOS", "pump-fun/pump-public-docs"))
+            if github_due and GITHUB_AUTO_DISCOVER:
+                try:
+                    discovery_obs, discovered = await self.github_discover()
+                    for obs in discovery_obs:
+                        self.store.put(obs)
+                    repos.update(discovered)
+                except Exception as exc:
+                    LOG.warning("GitHub owner discovery failed for %s: %s", GITHUB_OWNER, exc)
+                    discovery_failure = str(exc)[:180]
+                else:
+                    discovery_failure = None
+            else:
+                discovery_failure = None
+            if github_due:
+                for repo in sorted(repos):
+                    tasks.append((repo, self.github(repo)))
+                self.last_github_scan = time.monotonic()
             outcomes = await asyncio.gather(*(coro for _, coro in tasks), return_exceptions=True)
             updated = 0
             self.failures = {}
+            if discovery_failure:
+                self.failures[f"github-owner:{GITHUB_OWNER}"] = discovery_failure
             for (label, _), result in zip(tasks, outcomes):
                 if isinstance(result, BaseException):
                     self.failures[label] = str(result)[:180]
@@ -377,6 +462,7 @@ async def status(interaction: discord.Interaction):
     msg = (f"**Last scan:** {monitor.last_run}\n**Interval:** {INTERVAL} min\n"
            f"**Saved baselines:** {store.count()}\n**Watch URLs:** {len(store.watches())}\n"
            f"**Failures in last scan:** {len(monitor.failures)}\n"
+           f"**Failure details:** {str(monitor.failures)[:700] if monitor.failures else 'None'}\n"
            "App metadata, website assets, API shapes and public repositories are monitored independently.")
     await interaction.response.send_message(msg, ephemeral=True)
 
