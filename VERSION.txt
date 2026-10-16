@@ -1,0 +1,2 @@
+Pump.fun Public Update Tracker V4
+Website text alerts now show changed feature-related copy rather than `text changed`.

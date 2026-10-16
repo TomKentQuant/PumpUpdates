@@ -38,7 +38,7 @@ GITHUB_MAX_REPOS = max(1, min(50, int(os.getenv("GITHUB_MAX_REPOS", "15"))))
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 ASSET_MAX_FILES = max(1, min(20, int(os.getenv("ASSET_MAX_FILES", "10"))) )
 ASSET_MAX_BYTES = max(100_000, min(6_000_000, int(os.getenv("ASSET_MAX_BYTES", "2500000"))))
-FEATURE_TERMS = re.compile(r"(?i)(?:limit.?order|stop.?loss|take.?profit|copy.?trad(?:e|ing)|auto.?sell|auto.?buy|fee.?shar(?:e|ing)|creator.?fee|livestream|live.?stream|cash.?out|cross.?chain|bridge.?swap|launch.?token|token.?launch|migration|watchlist|notification.?setting|price.?alert)")
+FEATURE_TERMS = re.compile(r"(?i)(?:perpetuals?|perps?|futures?|leverag(?:e|ed)|long.?short|short.?long|long.?position|short.?position|stocks?.?trading|stop.?loss|limit.?order|take.?profit|copy.?trad(?:e|ing)|auto.?sell|auto.?buy|fee.?shar(?:e|ing)|creator.?fee|livestream|live.?stream|cash.?out|cross.?chain|bridge.?swap|launch.?token|token.?launch|migration|watchlist|notification.?setting|price.?alert)")
 JS_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]{2,90}")
 
 
@@ -63,6 +63,50 @@ def feature_clues(source: str) -> dict[str, str]:
             break
     return found
 
+
+
+
+# Public website copy is compared separately from asset fingerprints. A changed
+# counter, timestamp, token price or marketing layout should never page Discord.
+ANNOUNCEMENT_TERMS = {
+    "Perpetuals / leveraged trading": re.compile(r"(?i)\b(?:perps?|perpetuals?|futures?|leverage|leveraged|long\s*(?:/|or|and)\s*short|short\s*(?:/|or|and)\s*long)\b"),
+    "Trading features": re.compile(r"(?i)\b(?:limit orders?|stop.loss|take.profit|copy.trad(?:e|ing)|margin.trading|stock.trading)\b"),
+    "Product release": re.compile(r"(?i)\b(?:launch(?:ed|ing)?|introduc(?:e|ed|ing)|now available|new feature|roll(?:ed|ing)? out|just added|now live)\b"),
+}
+
+def website_delta(old: dict, new: dict) -> str:
+    """Return evidence for actionable new copy; empty suppresses noisy text churn."""
+    before = re.sub(r"\s+", " ", " ".join(str(old.get(k, "")) for k in ("title", "description", "text"))).strip()
+    after = re.sub(r"\s+", " ", " ".join(str(new.get(k, "")) for k in ("title", "description", "text"))).strip()
+    if before == after:
+        return ""
+    # Compare words, so insertions are shown rather than generic 'text changed'.
+    a, b = before.split(), after.split()
+    sm = difflib.SequenceMatcher(None, a[:4500], b[:4500], autojunk=False)
+    candidates = []
+    for op, a0, a1, b0, b1 in sm.get_opcodes():
+        if op not in ("insert", "replace"):
+            continue
+        new_words = b[b0:b1]
+        if not new_words:
+            continue
+        added = " ".join(new_words)
+        # Context makes even short inserted labels intelligible.
+        context = " ".join(b[max(0, b0-12):min(len(b), b1+16)])
+        matches = [name for name, pat in ANNOUNCEMENT_TERMS.items() if pat.search(added)]
+        if not matches:
+            continue
+        # 'long' by itself is ambiguous; our regex only treats paired trading
+        # terminology as notable. Maintain a tightly bounded excerpt.
+        excerpt = context[:420].strip()
+        if excerpt and excerpt not in candidates:
+            candidates.append((matches, excerpt))
+    if not candidates:
+        return ""
+    lines = []
+    for matches, excerpt in candidates[:3]:
+        lines.append(f"Signal: {', '.join(matches)}\nNew website text (with context): {excerpt}")
+    return "\n\n".join(lines)[:2200]
 
 
 def csv_env(name: str, default: str = "") -> list[str]:
@@ -173,7 +217,9 @@ class Store:
             return False
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         if prev and obs.kind != "WEB ASSETS":
-            if obs.kind == "WEB FEATURE SIGNALS":
+            if obs.kind == "WEBSITE":
+                detail = website_delta(json.loads(prev[0]), json.loads(val))
+            elif obs.kind == "WEB FEATURE SIGNALS":
                 before = json.loads(prev[0]).get("signals", {})
                 after = json.loads(val).get("signals", {})
                 fresh = {key: evidence for key, evidence in after.items() if key not in before}
@@ -187,8 +233,8 @@ class Store:
                 self.db.execute("INSERT INTO events(source,kind,label,url,details,created_at) VALUES(?,?,?,?,?,?)", (obs.source, obs.kind, obs.label, obs.url, detail[:2500], now))
         self.db.execute("INSERT INTO snapshots(source,payload,hash,updated_at) VALUES(?,?,?,?) ON CONFLICT(source) DO UPDATE SET payload=excluded.payload,hash=excluded.hash,updated_at=excluded.updated_at", (obs.source, val, digest, now))
         self.db.commit()
-        if obs.kind == "WEB ASSETS":
-            return False
+        if obs.kind in ("WEB ASSETS", "WEBSITE"):
+            return bool(prev and detail) if obs.kind == "WEBSITE" else False
         if obs.kind == "WEB FEATURE SIGNALS":
             return bool(prev and fresh)
         return bool(prev)
@@ -513,13 +559,17 @@ class TrackerBot(commands.Bot):
         if channel is None:
             channel = await self.fetch_channel(CHANNEL_ID)
         for event_id, kind, label, url, detail, created in self.monitor.store.pending():
-            if kind == "WEB ASSETS":
-                # Discard legacy pending V2 asset churn alerts on upgrade.
+            if kind == "WEB ASSETS" or (kind == "WEBSITE" and not detail.startswith("Signal:")):
+                # Discard legacy asset churn and uninformative generic website alerts.
                 self.monitor.store.mark_sent(event_id)
                 continue
             embed = discord.Embed(title=f"🔔 {label}", url=url, color=0x17C964, timestamp=dt.datetime.fromisoformat(created))
             embed.add_field(name="Source", value=kind, inline=True)
-            if kind == "WEB FEATURE SIGNALS":
+            if kind == "WEBSITE":
+                embed.title = "📣 New public website feature signal"
+                embed.add_field(name="What changed", value=discord.utils.escape_mentions(detail[:1000]), inline=False)
+                embed.add_field(name="Verify on source", value=f"[Open page]({url})", inline=False)
+            elif kind == "WEB FEATURE SIGNALS":
                 # URL outside code fences remains clickable in Discord.
                 match = re.search(r"Asset: (https://[^\s]+)", detail)
                 embed.add_field(name="Possible feature evidence (unverified)",
@@ -528,7 +578,7 @@ class TrackerBot(commands.Bot):
                     embed.add_field(name="Inspect changed JS asset", value=f"[Open public asset]({match.group(1)})", inline=False)
             else:
                 embed.add_field(name="Detected changes", value=f"```text\n{detail[:900]}\n```", inline=False)
-            embed.set_footer(text="Public-source observation • JS references are speculative, not confirmed iOS features")
+            embed.set_footer(text="Public website/code evidence • Confirm release against official announcement or app")
             try:
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             except (discord.HTTPException, discord.Forbidden) as e:

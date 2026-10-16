@@ -75,3 +75,31 @@ class V3Tests(unittest.TestCase):
         from tracker import feature_clues
         self.assertIn("limitorder", feature_clues("function createLimitOrder(){ return '/api/limit-order' }"))
         self.assertEqual(feature_clues("This is a livestream video example."), {})
+
+class V4WebsiteTests(unittest.TestCase):
+    def test_perps_announcement(self):
+        from tracker import website_delta
+        before = {"title": "Pump.fun", "description": "Trade meme coins", "text": "Explore tokens and find the latest coins."}
+        after = {"title": "Pump.fun", "description": "Trade meme coins", "text": "Explore tokens and find the latest coins. Pump just added perps to the app. Everyone will be able to LONG or SHORT crypto, stocks."}
+        result = website_delta(before, after)
+        self.assertIn("perps", result.lower())
+        self.assertIn("LONG or SHORT", result)
+
+    def test_noise_silent_and_database_dedup(self):
+        from tracker import website_delta
+        old = {"title": "Pump.fun", "description": "", "text": "Bitcoin price $10000 and 5 users"}
+        noisy = {"title": "Pump.fun", "description": "", "text": "Bitcoin price $10001 and 6 users"}
+        self.assertEqual(website_delta(old, noisy), "")
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(d + "/v4.sqlite")
+            key = "web:text:https://pump.fun/"
+            def obs(value):
+                return Observation(key, "WEBSITE", "https://pump.fun/", value, "Website content: /")
+            self.assertFalse(store.put(obs(old)))
+            self.assertFalse(store.put(obs(noisy)))
+            self.assertFalse(store.pending())
+            noteworthy = {"title":"Pump.fun","description":"", "text":"Bitcoin price $10001 and 6 users. Introducing perpetuals trading on the app."}
+            self.assertTrue(store.put(obs(noteworthy)))
+            self.assertEqual(len(store.pending()), 1)
+            self.assertFalse(store.put(obs(noteworthy)))
+            store.db.close()

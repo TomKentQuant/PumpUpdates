@@ -159,3 +159,9 @@ GitHub limits unauthenticated API requests to 60/hour, so without `GITHUB_TOKEN`
 ### Upgrade V2 → V3
 
 Upload **all V3 project files** to the root of your existing GitHub repository, replacing V2, and let Railway redeploy. Keep existing environment variables, Discord application, and persistent `/data` volume. Do not delete the database. The existing asset snapshot can be reused, while the new feature-clue collection will quietly establish its own baseline.
+
+## V4: actionable website announcements
+
+V4 replaces generic `~ text changed` website alerts with a bounded excerpt showing **what new text appeared** and a feature category, only when meaningful feature-related terms are found. Changes to ordinary numbers, counters and unrelated website copy are saved silently. This monitor observes only the pages configured in `WEB_URLS` or added via `/watch`; it **does not monitor X/Twitter posts** or reliably inspect a dynamically rendered iOS app screen. If a feature is announced only on social media or behind an authenticated UI, this monitor may miss it. An alert is a public-source *signal*, not confirmation that an iOS release occurred.
+
+Existing Railway environment variables and `/data` storage continue to work. Upload the latest `tracker.py` to the same GitHub repository; Railway redeploys automatically. Previously queued generic website alerts are skipped during message sending. No database reset is necessary.
