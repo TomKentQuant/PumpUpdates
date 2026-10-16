@@ -41,3 +41,37 @@ class TrackerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class V3Tests(unittest.TestCase):
+    def test_asset_churn_silent_but_saved(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Store(d + "/v3.sqlite")
+            def obs(paths):
+                return Observation("web:assets:https://pump.fun/", "WEB ASSETS", "https://pump.fun/", {"files": paths}, "Assets")
+            self.assertFalse(s.put(obs(["old.js"])))
+            self.assertFalse(s.put(obs(["new.js"])))
+            self.assertEqual(s.pending(), [])
+            self.assertEqual(s.get_snapshot("web:assets:https://pump.fun/")["files"], ["new.js"])
+            s.db.close()
+
+    def test_signal_baseline_and_repeat_suppression(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Store(d + "/v3.sqlite")
+            def obs(signals):
+                return Observation("web:features:https://pump.fun/", "WEB FEATURE SIGNALS", "https://pump.fun/", {"signals": signals}, "Features")
+            sample = {"limitorder": {"asset": "https://pump.fun/a.js", "excerpt": "createLimitOrder"}}
+            self.assertFalse(s.put(obs({})))
+            self.assertTrue(s.put(obs(sample)))
+            self.assertEqual(len(s.pending()), 1)
+            s.mark_sent(s.pending()[0][0])
+            self.assertFalse(s.put(obs(sample)))
+            # Same feature name in a new compiled asset is not a new feature.
+            other = {"limitorder": {"asset": "https://pump.fun/b.js", "excerpt": "showLimitOrder"}}
+            self.assertFalse(s.put(obs(other)))
+            self.assertEqual(len(s.pending()), 0)
+            s.db.close()
+
+    def test_feature_clues(self):
+        from tracker import feature_clues
+        self.assertIn("limitorder", feature_clues("function createLimitOrder(){ return '/api/limit-order' }"))
+        self.assertEqual(feature_clues("This is a livestream video example."), {})

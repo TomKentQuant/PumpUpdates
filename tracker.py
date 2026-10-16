@@ -36,6 +36,33 @@ GITHUB_OWNER = os.getenv("GITHUB_OWNER", "pump-fun").strip()
 GITHUB_AUTO_DISCOVER = os.getenv("GITHUB_AUTO_DISCOVER", "true").lower() == "true"
 GITHUB_MAX_REPOS = max(1, min(50, int(os.getenv("GITHUB_MAX_REPOS", "15"))))
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+ASSET_MAX_FILES = max(1, min(20, int(os.getenv("ASSET_MAX_FILES", "10"))) )
+ASSET_MAX_BYTES = max(100_000, min(6_000_000, int(os.getenv("ASSET_MAX_BYTES", "2500000"))))
+FEATURE_TERMS = re.compile(r"(?i)(?:limit.?order|stop.?loss|take.?profit|copy.?trad(?:e|ing)|auto.?sell|auto.?buy|fee.?shar(?:e|ing)|creator.?fee|livestream|live.?stream|cash.?out|cross.?chain|bridge.?swap|launch.?token|token.?launch|migration|watchlist|notification.?setting|price.?alert)")
+JS_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]{2,90}")
+
+
+def feature_clues(source: str) -> dict[str, str]:
+    """Conservative public-bundle hints. No credentials, claims of launches, or raw bundle dumps."""
+    found = {}
+    for match in FEATURE_TERMS.finditer(source):
+        start, end = match.span()
+        snippet = source[max(0, start - 85):min(len(source), end + 85)]
+        # Require a likely flag, UI label, API route or named symbol, not an isolated buzzword.
+        contextual = bool(re.search(r"(?i)(?:feature|enabled|flag|modal|button|route|endpoint|/api/|create|settings|toggle|is[A-Z]|show[A-Z]|\btitle\b|\blabel\b)", snippet))
+        if not contextual:
+            continue
+        term = re.sub(r"[^a-z0-9]", "", match.group().lower())
+        if term in found:
+            continue
+        # Only include safe short, bounded evidence (no full source, no query strings).
+        excerpt = re.sub(r"[\x00-\x1f]+", " ", snippet)
+        excerpt = re.sub(r"\s+", " ", excerpt).strip()[:175]
+        found[term] = excerpt
+        if len(found) >= 25:
+            break
+    return found
+
 
 
 def csv_env(name: str, default: str = "") -> list[str]:
@@ -145,12 +172,30 @@ class Store:
         if prev and prev[1] == digest:
             return False
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        if prev:
-            detail = "\n".join(changes(json.loads(prev[0]), json.loads(val))) or "Content fingerprint changed"
-            self.db.execute("INSERT INTO events(source,kind,label,url,details,created_at) VALUES(?,?,?,?,?,?)", (obs.source, obs.kind, obs.label, obs.url, detail[:2500], now))
+        if prev and obs.kind != "WEB ASSETS":
+            if obs.kind == "WEB FEATURE SIGNALS":
+                before = json.loads(prev[0]).get("signals", {})
+                after = json.loads(val).get("signals", {})
+                fresh = {key: evidence for key, evidence in after.items() if key not in before}
+                detail = "\n\n".join(
+                    f"POSSIBLE FEATURE REFERENCE: {key}\nAsset: {evidence['asset']}\nExcerpt: {evidence['excerpt']}"
+                    for key, evidence in list(fresh.items())[:5]
+                )
+            else:
+                detail = "\n".join(changes(json.loads(prev[0]), json.loads(val))) or "Content fingerprint changed"
+            if detail:
+                self.db.execute("INSERT INTO events(source,kind,label,url,details,created_at) VALUES(?,?,?,?,?,?)", (obs.source, obs.kind, obs.label, obs.url, detail[:2500], now))
         self.db.execute("INSERT INTO snapshots(source,payload,hash,updated_at) VALUES(?,?,?,?) ON CONFLICT(source) DO UPDATE SET payload=excluded.payload,hash=excluded.hash,updated_at=excluded.updated_at", (obs.source, val, digest, now))
         self.db.commit()
+        if obs.kind == "WEB ASSETS":
+            return False
+        if obs.kind == "WEB FEATURE SIGNALS":
+            return bool(prev and fresh)
         return bool(prev)
+
+    def get_snapshot(self, source):
+        row = self.db.execute("SELECT payload FROM snapshots WHERE source=?", (source,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def pending(self, limit=20):
         return self.db.execute("SELECT id,kind,label,url,details,created_at FROM events WHERE sent=0 ORDER BY id LIMIT ?", (limit,)).fetchall()
@@ -257,8 +302,51 @@ class Monitor:
             p = urlparse(abs_url)
             if is_allowed_url(abs_url) and re.search(r"\.(js|css)(?:$|\?)", abs_url, re.I):
                 assets.add(urlunparse((p.scheme, p.netloc, p.path, "", "", "")))
-        asset_obs = Observation(f"web:assets:{url}", "WEB ASSETS", url, {"files": sorted(assets)}, f"Website JS/CSS asset references: {urlparse(url).path or '/'}")
-        return [main, asset_obs]
+        asset_key = f"web:assets:{url}"
+        previous = self.store.get_snapshot(asset_key)
+        current = sorted(assets)
+        old_files = set(previous.get("files", [])) if previous else set()
+        added = sorted(assets - old_files)
+        removed = sorted(old_files - assets)
+        asset_obs = Observation(asset_key, "WEB ASSETS", url, {"files": current},
+                                f"Website JS/CSS asset references: {urlparse(url).path or '/'}")
+        # Asset fingerprint churn is noise; keep the inventory silently.
+        # Run analysis only on newly introduced JS files. First scan initializes
+        # evidence silently, and missing source data does not generate an alert.
+        signal_key = f"web:features:{url}"
+        old_signals = self.store.get_snapshot(signal_key)
+        accumulated = dict(old_signals.get("signals", {})) if old_signals else {}
+        to_check = [u for u in added if u.endswith(".js")][:ASSET_MAX_FILES]
+        for asset_url in to_check:
+            try:
+                script = await self.get_asset(asset_url)
+                for term, excerpt in feature_clues(script).items():
+                    # Preserve first occurrence to avoid repeat alerts on every build.
+                    accumulated.setdefault(term, {"asset": asset_url, "excerpt": excerpt})
+            except Exception as exc:
+                LOG.info("Optional JS feature inspection skipped %s: %s", asset_url, str(exc)[:100])
+        if added or removed:
+            LOG.info("Website assets: %d added, %d removed; inspected %d new JS files", len(added), len(removed), len(to_check))
+            for asset_url in added[:5]:
+                LOG.info("Added asset: %s", asset_url)
+        signals_obs = Observation(signal_key, "WEB FEATURE SIGNALS", url,
+                                  {"signals": accumulated}, "Possible feature references in public JS")
+        return [main, asset_obs, signals_obs]
+
+    async def get_asset(self, url: str) -> str:
+        """Read only bounded public first-party JavaScript; skip oversize bundles."""
+        if not is_allowed_url(url) or not urlparse(url).path.endswith(".js"):
+            raise ValueError("Not a permitted JavaScript URL")
+        async with self.client.stream("GET", url, headers={"Accept": "text/javascript,*/*"}) as response:
+            if response.is_redirect:
+                raise ValueError("Asset redirect refused")
+            response.raise_for_status()
+            chunks = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(chunks) + len(chunk) > ASSET_MAX_BYTES:
+                    raise ValueError("Large JS bundle skipped")
+                chunks.extend(chunk)
+            return chunks.decode("utf-8", errors="replace")
 
     async def json_endpoint(self, url: str, kind="PUBLIC API") -> list[Observation]:
         data = await self.get(url, json_body=True)
@@ -425,10 +513,22 @@ class TrackerBot(commands.Bot):
         if channel is None:
             channel = await self.fetch_channel(CHANNEL_ID)
         for event_id, kind, label, url, detail, created in self.monitor.store.pending():
+            if kind == "WEB ASSETS":
+                # Discard legacy pending V2 asset churn alerts on upgrade.
+                self.monitor.store.mark_sent(event_id)
+                continue
             embed = discord.Embed(title=f"🔔 {label}", url=url, color=0x17C964, timestamp=dt.datetime.fromisoformat(created))
             embed.add_field(name="Source", value=kind, inline=True)
-            embed.add_field(name="Detected changes", value=f"```text\n{detail[:900]}\n```", inline=False)
-            embed.set_footer(text="Public-source observation • Not a confirmed iOS feature unless App Store release notes say so")
+            if kind == "WEB FEATURE SIGNALS":
+                # URL outside code fences remains clickable in Discord.
+                match = re.search(r"Asset: (https://[^\s]+)", detail)
+                embed.add_field(name="Possible feature evidence (unverified)",
+                                value=discord.utils.escape_mentions(detail[:900]), inline=False)
+                if match:
+                    embed.add_field(name="Inspect changed JS asset", value=f"[Open public asset]({match.group(1)})", inline=False)
+            else:
+                embed.add_field(name="Detected changes", value=f"```text\n{detail[:900]}\n```", inline=False)
+            embed.set_footer(text="Public-source observation • JS references are speculative, not confirmed iOS features")
             try:
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             except (discord.HTTPException, discord.Forbidden) as e:

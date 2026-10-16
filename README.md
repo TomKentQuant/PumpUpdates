@@ -144,3 +144,18 @@ GitHub limits unauthenticated API requests to 60/hour, so without `GITHUB_TOKEN`
 **Pump.fun HTML fix:** Website page fetches now stream with an 8 MB upper bound (previously 2 MB). The limit still protects the bot from unexpectedly large responses. A `Response exceeds 8 MB limit` warning indicates the site is bigger still; you can temporarily set `WEB_URLS` empty to skip the web monitor without affecting GitHub/App Store.
 
 **Updating an existing Railway bot:** Replace `tracker.py` with the new copy and update `.env.example` / `README.md` in GitHub. Set the GitHub variables above in Railway. Keep the existing `/data` volume and `DATABASE_PATH` intact, so your baselines/history are preserved. GitHub repo discovery and new GitHub categories create baselines on their first successful run and alert only on later differences.
+
+## V3: quieter, evidence-based website JS alerts
+
+- **Website asset inventory changes are saved silently**, avoiding unhelpful `files (list 107 → 107)` alerts.
+- On first observation, the bot captures a baseline and does **not** announce already-existing findings.
+- Later, newly referenced first-party `.js` files are inspected, within strict size and count limits, for a **small conservative set of feature-related phrases with contextual clues**.
+- A new clue can generate a **possible feature reference** alert with a source asset URL and short excerpt. This is **not confirmation of an announced, released, or iOS feature**. It can also be a dead-code string or a previously existing feature.
+- Known clue names are stored on the existing persistent SQLite volume, so a rebuild that mentions the same clue does not re-alert.
+- `ASSET_MAX_FILES=10` controls how many new JS files are inspected per scan (1–20); `ASSET_MAX_BYTES=2500000` caps each JS download. Bigger bundles are skipped and **may contain changes the bot cannot detect**. Only public first-party `pump.fun` subdomains are fetched.
+- Asset URLs added/removed are written to Railway logs for debugging; noise does not hit Discord. No source-code diffing of every line is performed, and changes to a reused, unchanged asset URL are not detected.
+- The App Store, GitHub and configured public API monitors continue to run as before.
+
+### Upgrade V2 → V3
+
+Upload **all V3 project files** to the root of your existing GitHub repository, replacing V2, and let Railway redeploy. Keep existing environment variables, Discord application, and persistent `/data` volume. Do not delete the database. The existing asset snapshot can be reused, while the new feature-clue collection will quietly establish its own baseline.
